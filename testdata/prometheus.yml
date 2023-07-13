@@ -1,0 +1,58 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 8s
+
+scrape_configs:
+  - job_name: 'kubernetes-cadvisor'
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    kubernetes_sd_configs:
+      - role: node
+    honor_timestamps: false
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+    metric_relabel_configs:
+    # Limit input to only these metrics
+    - regex: ^container_cpu_usage_seconds_total|container_memory_working_set_bytes$
+      source_labels: [ __name__ ]
+      action: keep
+    # That contain a 'container' label
+    - source_labels: [ container ]
+      regex: (POD)|
+      action: drop
+    # That contain a 'pod' label
+    - source_labels: [ pod ]
+      regex: |
+      action: drop
+    # That contain a 'image' label
+    - source_labels: [ image ]
+      regex: |
+      action: drop
+    # That contain a 'name' label
+    - source_labels: [ name ]
+      regex: |
+      action: drop
+    # And keep these labels
+    - regex: ^(__name__|cluster_name|container|instance|name|kubernetes_io_arch|node_kubernetes_io_instance_type|pod|topology_kubernetes_io_region|topology_kubernetes_io_zone|workload_name|workload_namespace|workload_resource|namespace)$
+      action: labelkeep
+
+  - job_name: prometheus-agent-metrics
+    static_configs:
+    - targets:
+      - "localhost:9090"
+    metric_relabel_configs:
+    - action: keep
+      regex: ^up|scrape_duration_seconds|scrape_samples_post_metric_relabeling|scrape_samples_scraped|scrape_series_added|prometheus_agent_deleted_series|prometheus_remote.*|prometheus_agent_active_series$
+      source_labels: [ __name__ ]
+    - action: drop
+      regex: ^prometheus_remote_storage_exemplars$
+      source_labels: [ __name__ ]
