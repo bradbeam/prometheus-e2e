@@ -73,74 +73,31 @@ func TestMain(m *testing.M) {
 
 func TestPrometheus(t *testing.T) {
 	f := features.New("prometheus")
-	f.Setup(setupPrometheus())
+	f.Setup(deployPrometheus())
 	f.Assess("metrics remote written and filtered", assessPrometheus())
 	f.Teardown(teardownPrometheus())
 
 	testenv.Test(t, f.Feature())
 }
 
-func setupPrometheus() features.Func {
+func deployPrometheus() features.Func {
 	return func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+		// Remote Write
+		remoteWriteProgram, err := setupRemoteWrite()
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		// cAdvisors
-		cadvisorConfigs, err := gzipCadvisorConfigmaps(t)
+		cadvisorConfigs, cadvisorProgram, err := setupcAdvisors()
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		numcAdvisors := len(cadvisorConfigs)
 
-		cadvisorGoMod, err := os.ReadFile("./cmd/fake-cadvisor/go.mod")
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		cadvisorGoMain, err := os.ReadFile("./cmd/fake-cadvisor/main.go")
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		cadvisorProgram := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "cadvisor-go"},
-			Data: map[string]string{
-				"go.mod":  string(cadvisorGoMod),
-				"main.go": string(cadvisorGoMain),
-			},
-		}
-
-		// Remote Write
-		remoteWriteGoMod, err := os.ReadFile("./cmd/remote-write/go.mod")
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		remoteWriteGoMain, err := os.ReadFile("./cmd/remote-write/main.go")
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		remoteWriteProgram := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "remote-write-go"},
-			Data: map[string]string{
-				"go.mod":  string(remoteWriteGoMod),
-				"main.go": string(remoteWriteGoMain),
-			},
-		}
-
 		// Prometheus server
-		promConfigData, err := prometheusConfig(t, numcAdvisors)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		promConfigMap := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "prometheus-config"},
-			Data: map[string]string{
-				"prometheus.yml": string(promConfigData),
-			},
-		}
-
-		promDeployment := newPrometheusDeployment(numcAdvisors)
+		promDeployment, promConfigMap, err := setupPrometheus(numcAdvisors)
 
 		objects := []k8s.Object{
 			cadvisorProgram,
@@ -161,47 +118,55 @@ func setupPrometheus() features.Func {
 			}
 		}
 
-		// Handy function to wait for pod to be running
-		err = wait.For(
-			conditions.New(cfg.Client().Resources()).
-				DeploymentConditionMatch(promDeployment, appsv1.DeploymentAvailable, corev1.ConditionTrue),
-			wait.WithTimeout(time.Minute*1),
-			wait.WithInterval(100*time.Millisecond),
-		)
-		if err != nil {
-			t.Fatalf("failed to find all pods running for %s: %v", promDeployment.GetObjectMeta().GetName(), err)
-		}
-
-		// Get prometheus pod
-		podList := &corev1.PodList{}
-		err = cfg.Client().Resources().WithNamespace(cfg.Namespace()).List(ctx, podList, resources.WithLabelSelector("app=prometheus"))
-		if err != nil {
+		if err := waitForPrometheus(ctx, t, cfg, promDeployment, numcAdvisors); err != nil {
 			t.Fatal(err)
-		}
-
-		if len(podList.Items) != 1 {
-			t.Fatalf("expected 1 prometheus pod but got %d", len(podList.Items))
-		}
-
-		expectedUpDog := generateUpDog(numcAdvisors)
-
-		// Wait for all of the cadvsiors scrapes to complete
-		// // This should be enough to signify that remote write is complete as well
-		err = wait.For(
-			func() (bool, error) {
-				// Going to ignore the errors here because we want to retry
-				done, _ := execAndGetMetrics(ctx, cfg, podList.Items[0].Name, strings.NewReader(expectedUpDog), []string{"up"})
-				return done, nil
-			},
-			wait.WithInterval(1*time.Second),
-			wait.WithImmediate(),
-		)
-		if err != nil {
-			t.Fatalf("failed to fetch up metrics for %s: %v", promDeployment.GetObjectMeta().GetName(), err)
 		}
 
 		return ctx
 	}
+}
+
+func waitForPrometheus(ctx context.Context, t *testing.T, cfg *envconf.Config, promDeployment *appsv1.Deployment, numcAdvisors int) error {
+	// Handy function to wait for pod to be running
+	err := wait.For(
+		conditions.New(cfg.Client().Resources()).
+			DeploymentConditionMatch(promDeployment, appsv1.DeploymentAvailable, corev1.ConditionTrue),
+		wait.WithTimeout(time.Minute*1),
+		wait.WithInterval(100*time.Millisecond),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Get prometheus pod
+	podList := &corev1.PodList{}
+	err = cfg.Client().Resources().WithNamespace(cfg.Namespace()).List(ctx, podList, resources.WithLabelSelector("app=prometheus"))
+	if err != nil {
+		return err
+	}
+
+	if len(podList.Items) != 1 {
+		return fmt.Errorf("expected 1 prometheus pod but got %d", len(podList.Items))
+	}
+
+	expectedUpDog := generateUpDog(numcAdvisors)
+
+	// Wait for all of the cadvsiors scrapes to complete
+	// // This should be enough to signify that remote write is complete as well
+	err = wait.For(
+		func() (bool, error) {
+			// Going to ignore the errors here because we want to retry
+			done, _ := execAndGetMetrics(ctx, cfg, podList.Items[0].Name, strings.NewReader(expectedUpDog), []string{"up"})
+			return done, nil
+		},
+		wait.WithInterval(1*time.Second),
+		wait.WithImmediate(),
+	)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func assessPrometheus() features.Func {
@@ -279,7 +244,7 @@ func teardownKubeObjects(objects []k8s.Object, labelSelectors map[string]string)
 // prometheusConfig reads in a base prometheus config and modifies the config
 // to add in a scrape config for each cAdvisor instance as well as a remote write
 // destination.
-func prometheusConfig(t *testing.T, numcAdvisors int) ([]byte, error) {
+func prometheusConfig(numcAdvisors int) ([]byte, error) {
 
 	// Read in our base config
 	data, err := os.ReadFile("testdata/prometheus.yml")
@@ -505,7 +470,7 @@ func newPrometheusDeployment(numcAdvisors int) *appsv1.Deployment {
 	return deployment
 }
 
-func gzipCadvisorConfigmaps(t *testing.T) ([]*corev1.ConfigMap, error) {
+func gzipCadvisorConfigmaps() ([]*corev1.ConfigMap, error) {
 	configmaps := []*corev1.ConfigMap{}
 
 	cadvisorIdx := 0
@@ -569,4 +534,71 @@ func gzipCadvisorConfigmaps(t *testing.T) ([]*corev1.ConfigMap, error) {
 	}
 
 	return configmaps, nil
+}
+
+func setupcAdvisors() ([]*corev1.ConfigMap, *corev1.ConfigMap, error) {
+	cadvisorConfigs, err := gzipCadvisorConfigmaps()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cadvisorGoMod, err := os.ReadFile("./cmd/fake-cadvisor/go.mod")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cadvisorGoMain, err := os.ReadFile("./cmd/fake-cadvisor/main.go")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cadvisorProgram := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cadvisor-go"},
+		Data: map[string]string{
+			"go.mod":  string(cadvisorGoMod),
+			"main.go": string(cadvisorGoMain),
+		},
+	}
+
+	return cadvisorConfigs, cadvisorProgram, nil
+}
+
+func setupRemoteWrite() (*corev1.ConfigMap, error) {
+	remoteWriteGoMod, err := os.ReadFile("./cmd/remote-write/go.mod")
+	if err != nil {
+		return nil, err
+	}
+
+	remoteWriteGoMain, err := os.ReadFile("./cmd/remote-write/main.go")
+	if err != nil {
+		return nil, err
+	}
+
+	remoteWriteProgram := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "remote-write-go"},
+		Data: map[string]string{
+			"go.mod":  string(remoteWriteGoMod),
+			"main.go": string(remoteWriteGoMain),
+		},
+	}
+
+	return remoteWriteProgram, nil
+}
+
+func setupPrometheus(numcAdvisors int) (*appsv1.Deployment, *corev1.ConfigMap, error) {
+	promConfigData, err := prometheusConfig(numcAdvisors)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	promConfigMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "prometheus-config"},
+		Data: map[string]string{
+			"prometheus.yml": string(promConfigData),
+		},
+	}
+
+	promDeployment := newPrometheusDeployment(numcAdvisors)
+
+	return promDeployment, promConfigMap, nil
 }
