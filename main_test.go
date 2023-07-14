@@ -31,7 +31,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/e2e-framework/klient/conf"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -54,18 +53,18 @@ func init() {
 func TestMain(m *testing.M) {
 	testenv = env.New()
 
-	path := conf.ResolveKubeConfigFile()
-	cfg := envconf.NewWithKubeConfig(path)
-	testenv = env.NewWithConfig(cfg)
+	kindClusterName := envconf.RandomName("my-cluster", 16)
 
 	namespace := envconf.RandomName("sample-ns", 16)
 
 	testenv.Setup(
+		envfuncs.CreateKindCluster(kindClusterName),
 		envfuncs.CreateNamespace(namespace),
 	)
 
 	testenv.Finish(
 		envfuncs.DeleteNamespace(namespace),
+		envfuncs.DestroyKindCluster(kindClusterName),
 	)
 
 	os.Exit(testenv.Run(m))
